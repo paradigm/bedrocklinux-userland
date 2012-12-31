@@ -165,7 +165,7 @@ void get_chroot_path(char* argv[], char* chroot_path){
 			 */
 			sscanf(line," %[^= ] = %s",key,value);
 			if(strncmp(key,"path",5) == 0 && strncmp(value,"",1) != 0){
-				snprintf(chroot_path, PATH_MAX, "%s%s", chroot_path, value);
+				strncat(chroot_path, value, PATH_MAX);
 				fclose(fp);
 				return;
 			}
