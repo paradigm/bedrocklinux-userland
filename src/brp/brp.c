@@ -626,14 +626,14 @@ int brp_realpath(char *in_path, char *out_path, size_t bufsize)
 	const int LOOP_MAX = 20;
 	int end = 0;
 	int loop = 0;
-	size_t offset;
 	ssize_t readlink_len;
 	struct stat stbuf;
+	size_t stratum_prefix_len, path_fragment_len, current_path_len;
 
-	char current_path[bufsize];
-	char link_path[bufsize];
-	char path_fragment[bufsize];
-	char stratum_prefix[bufsize];
+	char current_path[PATH_MAX+1];
+	char link_path[PATH_MAX+1];
+	char path_fragment[PATH_MAX+1];
+	char stratum_prefix[PATH_MAX+1];
 
 	/*
 	 * Ensure incoming path is in stratum_prefix/<stratum>/, get stratum
@@ -643,15 +643,20 @@ int brp_realpath(char *in_path, char *out_path, size_t bufsize)
 		return -EINVAL;
 	}
 	slash = in_path + STRATA_ROOT_LEN + 1;
-	while (*slash != '/') {
-		slash++;
-	}
-	strncpy(stratum_prefix, in_path, slash - in_path + 1);
-	stratum_prefix[slash - in_path + 1] = '\0';
-	size_t stratum_prefix_len = strlen(stratum_prefix);
-	offset = stratum_prefix_len+1;
+	slash = strchr(slash, '/');
 
-	strcpy(current_path, in_path);
+	strncpy(stratum_prefix, in_path, slash-in_path+1);
+	stratum_prefix[slash-in_path+1] = '\0';
+	stratum_prefix_len = slash-in_path+1;
+
+	/*
+	 * Copy the path components after 'stratum_prefix/'
+	 */
+	strcpy(current_path, slash+1);
+	strcpy(path_fragment, stratum_prefix);
+	path_fragment_len = stratum_prefix_len;
+	current_path_len = strlen(current_path);
+	slash = current_path;
 
 	/*
 	 * Loop over every directory in a given file path, e.g. in
@@ -661,61 +666,72 @@ int brp_realpath(char *in_path, char *out_path, size_t bufsize)
 	 */
 	while (1) {
 		/* find next file/directory in file path */
-		while (current_path[offset] != '/' && current_path[offset] != '\0') {
-			offset++;
-		}
+		int ret;
+		char *next_slash = strchr(slash, '/');
+		size_t left_len, last_path_fragment_len = path_fragment_len;
+
 		/* on final item in file path, the file itself */
-		if (current_path[offset] == '\0') {
+		if (next_slash == NULL) {
 			end = 1;
-		}
-		/* starting / */
-		if (offset == 0 && current_path[offset] == '/') {
-			offset++;
-			continue;
-		}
-		/* would overflow */
-		if (offset >= bufsize) {
-			return -ENAMETOOLONG;
+			strcpy(path_fragment+path_fragment_len, slash);
+			path_fragment_len += strlen(slash);
+			left_len = 0;
+		} else {
+			strncpy(path_fragment+path_fragment_len, slash, next_slash-slash+1);
+			path_fragment_len += next_slash-slash+1;
+			path_fragment[path_fragment_len] = '\0';
+			left_len = current_path_len-(next_slash-current_path);
 		}
 
-		strncpy(path_fragment, current_path, offset);
-		path_fragment[offset] = '\0';
+		ret = lstat(path_fragment, &stbuf);
+		if (ret != 0)
+			return ret;
 
-		if (lstat(path_fragment, &stbuf) != 0) {
-			return -ENOENT;
-		}
 		if (!S_ISLNK(stbuf.st_mode) && !end) {
-			offset++;
+			slash = next_slash+1;
 			continue;
 		}
 		if (!S_ISLNK(stbuf.st_mode) && end) {
-			strcpy(out_path, current_path);
+			if (path_fragment_len > bufsize)
+				return -ENAMETOOLONG;
+
+			strcpy(out_path, path_fragment);
 			return 1;
 		}
 		if (S_ISLNK(stbuf.st_mode)) {
-			if ((readlink_len = readlink(path_fragment, link_path, bufsize)) < 0) {
+			if ((readlink_len = readlink(path_fragment, link_path, PATH_MAX)) < 0) {
 				return -errno;
 			}
 			link_path[readlink_len] = '\0';
 			if (link_path[0] == '/') {
 				/* absolute symlink */
-				strcpy(out_path, stratum_prefix);
-				strcat(out_path, link_path+1);
-				strcat(out_path, current_path + offset);
+				current_path_len = readlink_len-1+left_len;
+
+				if (current_path_len > PATH_MAX)
+					return -ENAMETOOLONG;
+
+				/* replace the current component of current_path with link_path */
+				memmove(current_path+readlink_len-1, next_slash, left_len);
+				strncpy(current_path, link_path+1, readlink_len-1);
+				path_fragment_len = stratum_prefix_len;
+
+				slash = current_path;
 			} else {
 				/* relative symlink */
-				if ( (slash = strrchr(path_fragment, '/')) ) {
-					strncpy(out_path, path_fragment, slash - path_fragment + 1);
-					out_path[slash - path_fragment + 1] = '\0';
-				} else {
-					strcpy(out_path, "./");
-				}
-				strcat(out_path, link_path);
-				strcat(out_path, current_path + offset);
+				current_path_len = (slash-current_path)+readlink_len+left_len;
+
+				if (current_path_len > PATH_MAX)
+					return -ENAMETOOLONG;
+
+				/* replace the current component of current_path with link_path */
+				memmove(slash+strlen(link_path), next_slash, left_len);
+				strncpy(slash, link_path, readlink_len);
+
+				/* go back one component */
+				path_fragment_len = last_path_fragment_len;
 			}
-			offset = stratum_prefix_len+1;
 			end = 0;
-			strcpy(current_path, out_path);
+			current_path[current_path_len] = '\0';
 			if ((loop++) >= LOOP_MAX) {
 				return -ELOOP;
 			}
@@ -731,7 +747,8 @@ int brp_stat(char *path, struct stat *stbuf)
 {
 	char out_path[PATH_MAX+1];
 	int ret;
-	if ((ret = brp_realpath(path, out_path, PATH_MAX+1)) < 0) {
+
+	if ((ret = brp_realpath(path, out_path, PATH_MAX)) < 0) {
 		/* could not resolve symlink */
 		return ret;
 	} else if (!stbuf) {
