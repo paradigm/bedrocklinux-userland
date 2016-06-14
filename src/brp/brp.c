@@ -303,7 +303,7 @@ void parse_config()
 			out_items[i].in_items[j].stratum = malloc((strlen(line)+1) * sizeof(char));
 			strcpy(out_items[i].in_items[j].stratum, line);
 			out_items[i].in_items[j].stratum_len = strlen(line);
-			
+
 			/* get stratum path */
 			fgets(line, maxlinelen, fp);
 			line[strlen(line)-1] = '\0'; /* strip newline */
@@ -745,10 +745,10 @@ int brp_stat(char *path, struct stat *stbuf)
 /*
  * Given an input path, finds the corresponding content to output (if any) and
  * populates various related fields (e.g. stat info) accordingly.
+ *
+ * Returns a file descriptor to the found file, -ENOENT indicates not found
  */
 int corresponding(char *in_path,
-		char* out_path,
-		size_t out_path_size,
 		struct stat *stbuf,
 		struct out_item **arg_out_item,
 		struct in_item **arg_in_item,
@@ -762,7 +762,7 @@ int corresponding(char *in_path,
 
 	size_t i, j;
 	size_t in_path_len = strlen(in_path);
-	char tmp_path[out_path_size+1];
+	char tmp_path[PATH_MAX+1], out_path[PATH_MAX+1];
 
 	/* check for a match on something contained in one of the configured
 	 * directories */
@@ -771,17 +771,20 @@ int corresponding(char *in_path,
 				in_path[out_items[i].path_len] == '/' &&
 				out_items[i].file_type == FILE_TYPE_DIRECTORY) {
 			for (j = 0; j < out_items[i].in_item_count; j++) {
-				strncpy(tmp_path, out_items[i].in_items[j].full_path, out_path_size);
-				strncat(tmp_path, in_path + out_items[i].path_len, out_path_size - out_items[i].in_items[j].full_path_len);
-				if (strlen(tmp_path) == out_path_size) {
+				strncpy(tmp_path, out_items[i].in_items[j].full_path, PATH_MAX);
+				strncat(tmp_path, in_path + out_items[i].path_len, PATH_MAX-out_items[i].in_items[j].full_path_len);
+				if (strlen(tmp_path) == PATH_MAX) {
 					/* would have buffer overflowed, treat as bad value */
 					continue;
 				}
-				if (brp_realpath(tmp_path, out_path, out_path_size) >= 0 && lstat(out_path, stbuf) >= 0) {
+				if (brp_realpath(tmp_path, out_path, PATH_MAX) >= 0 && lstat(out_path, stbuf) >= 0) {
 					*arg_out_item = &out_items[i];
 					*arg_in_item = &out_items[i].in_items[j];
 					*tail = in_path + out_items[i].path_len;
-					return 0;
+					if (S_ISDIR(stbuf->st_mode))
+						return open(out_path, O_RDONLY | O_DIRECTORY);
+					else
+						return open(out_path, O_RDONLY);
 				}
 			}
 		}
@@ -794,16 +797,19 @@ int corresponding(char *in_path,
 		if (strncmp(out_items[i].path, in_path, in_path_len) == 0 &&
 				(out_items[i].path[in_path_len] == '\0')) {
 			for (j = 0; j < out_items[i].in_item_count; j++) {
-				if (brp_realpath(out_items[i].in_items[j].full_path, out_path, out_path_size) >=0) {
-					if (out_items[i].file_type == FILE_TYPE_DIRECTORY) {
-						memcpy(stbuf, &parent_stat, sizeof(parent_stat));
-					} else {
-						lstat(out_path, stbuf);
-					}
+				if (brp_realpath(out_items[i].in_items[j].full_path, out_path, PATH_MAX) >=0) {
+					int fd = -1;
 					*arg_out_item = &out_items[i];
 					*arg_in_item = &out_items[i].in_items[j];
 					*tail = "";
-					return 0;
+					if (out_items[i].file_type == FILE_TYPE_DIRECTORY) {
+						memcpy(stbuf, &parent_stat, sizeof(parent_stat));
+						fd = open(out_path, O_RDONLY | O_DIRECTORY);
+					} else {
+						lstat(out_path, stbuf);
+						fd = open(out_path, O_RDONLY);
+					}
+					return fd;
 				}
 			}
 		}
@@ -817,13 +823,18 @@ int corresponding(char *in_path,
 		if (strncmp(out_items[i].path, in_path, in_path_len) == 0 &&
 				(out_items[i].path[in_path_len] == '/')) {
 			for (j = 0; j < out_items[i].in_item_count; j++) {
-				if (brp_realpath(out_items[i].in_items[j].full_path, out_path, out_path_size) >=0 &&
+				if (brp_realpath(out_items[i].in_items[j].full_path, out_path, PATH_MAX) >=0 &&
 						lstat(out_path, stbuf) >= 0) {
-					memcpy(stbuf, &parent_stat, sizeof(parent_stat));
+					int fd;
 					*arg_out_item = &out_items[i];
 					*arg_in_item = &out_items[i].in_items[j];
 					*tail = "";
-					return 0;
+					if (S_ISDIR(stbuf->st_mode))
+						fd = open(out_path, O_RDONLY | O_DIRECTORY);
+					else
+						fd = open(out_path, O_RDONLY);
+					memcpy(stbuf, &parent_stat, sizeof(parent_stat));
+					return fd;
 				}
 			}
 		}
@@ -836,7 +847,7 @@ int corresponding(char *in_path,
  * Apply relevant filter to getattr output.
  */
 void stat_filter(struct stat *stbuf,
-		const char const *in_path,
+		int in_fd,
 		int filter,
 		struct in_item *item,
 		const char *tail)
@@ -851,6 +862,7 @@ void stat_filter(struct stat *stbuf,
 
 	if (S_ISDIR(stbuf->st_mode)) {
 		/* filters below only touch files */
+		close(in_fd);
 		return;
 	}
 
@@ -872,7 +884,7 @@ void stat_filter(struct stat *stbuf,
 		break;
 
 	case FILTER_EXEC:
-		fp = fopen(in_path, "r");
+		fp = fdopen(in_fd, "r");
 		if (fp != NULL) {
 			while (fgets(line, PATH_MAX, fp) != NULL) {
 				if (strncmp(line, "Exec=", strlen("Exec=")) == 0 ||
@@ -890,12 +902,13 @@ void stat_filter(struct stat *stbuf,
 		break;
 
 	}
+	close(in_fd);
 }
 
 /*
  * Do read() and apply relevant filter.
  */
-int read_filter(const char *in_path,
+int read_filter(int in_fd,
 		int filter,
 		struct in_item *item,
 		const char *tail,
@@ -904,8 +917,8 @@ int read_filter(const char *in_path,
 		off_t offset)
 {
 	char *execs[] = {"TryExec=", "ExecStart=", "ExecStop=", "ExecReload=", "Exec="};
-	size_t exec_cnt = sizeof(execs) / sizeof(execs[0]);
-	int fd, ret;
+	size_t exec_cnt = sizeof(execs) / sizeof(execs[0]), left_to_skip, written;
+	int ret;
 	const size_t line_max = PATH_MAX;
 	char line[line_max+1];
 	FILE *fp;
@@ -913,64 +926,54 @@ int read_filter(const char *in_path,
 	switch (filter) {
 
 	case FILTER_PASS:
-		if ((fd = open(in_path, O_RDONLY)) >= 0) {
-			ret = pread(fd, buf, size, offset);
-			close(fd);
-			return ret;
-		}
-		return fd;
-		break;
+		ret = pread(in_fd, buf, size, offset);
+		close(in_fd);
+		return ret;
 
 	case FILTER_BRC_WRAP:
-		if (access(in_path, F_OK) == 0) {
-			size_t left_to_skip = offset;
-			size_t written = 0;
-			strcatoffset(buf, "#!/bedrock/libexec/busybox sh\nexec /bedrock/bin/brc ", &left_to_skip, &written, size);
-			strcatoffset(buf, item->stratum, &left_to_skip, &written, size);
-			strcatoffset(buf, " ", &left_to_skip, &written, size);
-			strcatoffset(buf, item->stratum_path, &left_to_skip, &written, size);
-			strcatoffset(buf, tail, &left_to_skip, &written, size);
-			strcatoffset(buf, " \"$@\"\n", &left_to_skip, &written, size);
-			return written;
-		} else {
-			return -EPERM;
-		}
-		break;
+		close(in_fd);
+
+		left_to_skip = offset;
+		written = 0;
+		strcatoffset(buf, "#!/bedrock/libexec/busybox sh\nexec /bedrock/bin/brc ", &left_to_skip, &written, size);
+		strcatoffset(buf, item->stratum, &left_to_skip, &written, size);
+		strcatoffset(buf, " ", &left_to_skip, &written, size);
+		strcatoffset(buf, item->stratum_path, &left_to_skip, &written, size);
+		strcatoffset(buf, tail, &left_to_skip, &written, size);
+		strcatoffset(buf, " \"$@\"\n", &left_to_skip, &written, size);
+		return written;
 
 	case FILTER_EXEC:
-		if (access(in_path, F_OK) == 0) {
-			size_t left_to_skip = offset;
-			size_t written = 0;
-			fp = fopen(in_path, "r");
-			if (!fp) {
-				return -errno;
-			}
-			while (fgets(line, line_max, fp) != NULL) {
-				size_t i;
-				int found = 0;
-				for (i = 0; i < exec_cnt; i++) {
-					if (strncmp(line, execs[i], strlen(execs[i])) == 0) {
-						found = 1;
-						strcatoffset(buf, execs[i], &left_to_skip, &written, size);
-						strcatoffset(buf, "/bedrock/bin/brc ", &left_to_skip, &written, size);
-						strcatoffset(buf, item->stratum, &left_to_skip, &written, size);
-						strcatoffset(buf, " ", &left_to_skip, &written, size);
-						strcatoffset(buf, line + strlen(execs[i]), &left_to_skip, &written, size);
-					}
-				}
-				if (!found) {
-					strcatoffset(buf, line, &left_to_skip, &written, size);
-				}
-				if (written >= size) {
-					break;
-				}
-			}
-			fclose(fp);
-			return written;
-		} else {
-			return -EPERM;
+		left_to_skip = offset;
+		written = 0;
+		fp = fdopen(in_fd, "r");
+		if (!fp) {
+			int ret = errno;
+			close(in_fd);
+			return -ret;
 		}
-		break;
+		while (fgets(line, line_max, fp) != NULL) {
+			size_t i;
+			int found = 0;
+			for (i = 0; i < exec_cnt; i++) {
+				if (strncmp(line, execs[i], strlen(execs[i])) == 0) {
+					found = 1;
+					strcatoffset(buf, execs[i], &left_to_skip, &written, size);
+					strcatoffset(buf, "/bedrock/bin/brc ", &left_to_skip, &written, size);
+					strcatoffset(buf, item->stratum, &left_to_skip, &written, size);
+					strcatoffset(buf, " ", &left_to_skip, &written, size);
+					strcatoffset(buf, line + strlen(execs[i]), &left_to_skip, &written, size);
+				}
+			}
+			if (!found) {
+				strcatoffset(buf, line, &left_to_skip, &written, size);
+			}
+			if (written >= size) {
+				break;
+			}
+		}
+		fclose(fp);
+		return written;
 	}
 
 	return -ENOENT;
@@ -990,7 +993,6 @@ static int brp_getattr(const char const *in_path, struct stat *stbuf)
 {
 	SET_CALLER_UID();
 
-	char out_path[PATH_MAX+1];
 	struct out_item *out_item;
 	struct in_item *in_item;
 	char *tail;
@@ -1014,8 +1016,8 @@ static int brp_getattr(const char const *in_path, struct stat *stbuf)
 		}
 	}
 
-	if ( (ret = corresponding((char*)in_path, out_path, PATH_MAX, stbuf, &out_item, &in_item, &tail)) >= 0) {
-		stat_filter(stbuf, out_path, out_item->filter, in_item, tail);
+	if ( (ret = corresponding((char*)in_path, stbuf, &out_item, &in_item, &tail)) >= 0) {
+		stat_filter(stbuf, ret, out_item->filter, in_item, tail);
 		return 0;
 	} else {
 		return ret;
@@ -1065,9 +1067,9 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 					/* would have buffer overflowed, treat as bad value */
 					continue;
 				}
-				if (brp_stat(out_path, &stbuf) < 0) {
+				if (brp_stat(out_path, &stbuf) < 0)
 					continue;
-				}
+
 				if (S_ISDIR(stbuf.st_mode)) {
 					if (! (d = opendir(out_path)) ) {
 						continue;
@@ -1134,7 +1136,6 @@ static int brp_open(const char *in_path, struct fuse_file_info *fi)
 {
 	SET_CALLER_UID();
 
-	char out_path[PATH_MAX+1];
 	struct out_item *out_item;
 	struct in_item *in_item;
 	char *tail;
@@ -1168,7 +1169,8 @@ static int brp_open(const char *in_path, struct fuse_file_info *fi)
 		return -EACCES;
 	}
 
-	if ( (ret = corresponding((char*)in_path, out_path, PATH_MAX, &stbuf, &out_item, &in_item, &tail)) >= 0) {
+	if ( (ret = corresponding((char*)in_path, &stbuf, &out_item, &in_item, &tail)) >= 0) {
+		close(ret);
 		return 0;
 	}
 	return -ENOENT;
@@ -1181,7 +1183,6 @@ static int brp_read(const char *in_path, char *buf, size_t size, off_t offset, s
 {
 	SET_CALLER_UID();
 
-	char out_path[PATH_MAX+1];
 	struct out_item *out_item;
 	struct in_item *in_item;
 	char *tail;
@@ -1200,12 +1201,12 @@ static int brp_read(const char *in_path, char *buf, size_t size, off_t offset, s
 		return ret;
 	}
 
-	ret = corresponding((char*) in_path, out_path, PATH_MAX, &stbuf, &out_item, &in_item, &tail);
+	ret = corresponding((char*) in_path, &stbuf, &out_item, &in_item, &tail);
 	if (ret < 0) {
 		return ret;
 	}
 
-	return read_filter(out_path, out_item->filter, in_item, tail, buf, size, offset);
+	return read_filter(ret, out_item->filter, in_item, tail, buf, size, offset);
 }
 
 /*
