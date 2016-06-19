@@ -1,5 +1,5 @@
-all: brp.c
-	$(CC) -Wall -static brp.c -o brp -lfuse -lbedrock
+all: brp.c parser.c
+	$(CC) -Wall -static brp.c parser.c -o brp -lfuse -lbedrock
 
 clean:
 	-rm brp
