@@ -371,6 +371,9 @@ enable_strata() {
 	then
 		rm /bedrock/run/deleteme
 	fi
+
+	# Make brp search the newly enabled stratum
+	echo 1 > /bedrock/brpath/reparse_config &
 }
 
 mount_fstab() {
