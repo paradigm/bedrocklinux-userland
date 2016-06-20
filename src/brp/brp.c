@@ -601,7 +601,13 @@ int corresponding(char *in_path,
 	char tmp_path[PATH_MAX+1];
 	int *stratum_root_fd = malloc(sizeof(int)*nstratum);
 
-	int ret = chdir(STRATA_ROOT);
+	int ret = seteuid(0);
+	if (unlikely(ret < 0)) {
+		perror("seteuid");
+		exit(1);
+	}
+
+	ret = chdir(STRATA_ROOT);
 	if (unlikely(ret < 0)) {
 		// strata root missing?!
 		perror("Failed to chdir to strata root");
@@ -615,18 +621,12 @@ int corresponding(char *in_path,
 		if (unlikely(stratum_root_fd[st] < 0))
 			continue;
 
-		ret = seteuid(0);
-		if (unlikely(ret < 0))
-			return -errno;
-
 		ret = fchdir(stratum_root_fd[st]);
 		if (unlikely(ret < 0))
 			continue;
 		ret = chroot(".");
 		if (unlikely(ret < 0))
 			continue;
-
-		SET_CALLER_UID();
 
 		/* check for a match on something contained in one of the configured
 		 * directories */
@@ -648,6 +648,19 @@ int corresponding(char *in_path,
 				ret = stat(tmp_path, stbuf);
 				if (ret < 0)
 					continue;
+
+				// Check again with proper permission
+				SET_CALLER_UID();
+				ret = stat(tmp_path, stbuf);
+				if (unlikely(ret < 0)) {
+					ret = seteuid(0);
+					if (unlikely(ret < 0)) {
+						perror("seteuid");
+						exit(1);
+					}
+					continue;
+				}
+
 				*arg_out_item = &out_items[i];
 				*arg_in_item = &out_items[i].in_items[j];
 				*stratum_id = st;
@@ -677,6 +690,18 @@ int corresponding(char *in_path,
 				int ret = stat(in_item[j].path, stbuf);
 				if (ret < 0)
 					continue;
+
+				// Check again with proper permission
+				SET_CALLER_UID();
+				ret = stat(in_item[j].path, stbuf);
+				if (unlikely(ret < 0)) {
+					ret = seteuid(0);
+					if (unlikely(ret < 0)) {
+						perror("seteuid");
+						exit(1);
+					}
+					continue;
+				}
 				*arg_out_item = &out_items[i];
 				*arg_in_item = &out_items[i].in_items[j];
 				*stratum_id = st;
