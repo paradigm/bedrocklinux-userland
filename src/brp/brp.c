@@ -724,28 +724,27 @@ int corresponding(char *in_path, struct stat *stbuf,
 	char stratum_prefix[PATH_MAX + 1], tmp_path[PATH_MAX + 1];
 	strcpy(stratum_prefix, STRATA_ROOT);
 
-	/* check for a match on something contained in one of the configured
-	 * directories */
-	for (i = 0; i < out_item_count; i++) {
-		if (strncmp(in_path, out_items[i].path,
-			    out_items[i].path_len) ||
-		    in_path[out_items[i].path_len] != '/' ||
-		    out_items[i].file_type != FILE_TYPE_DIRECTORY)
+	for (st = 0; st < nstratum; st++) {
+		if (unlikely(STRATA_ROOT_LEN + stratum_len[st] > PATH_MAX))
 			continue;
-		struct in_item *in_item = out_items[i].in_items;
-		for (j = 0; j < out_items[i].in_item_count; j++) {
-			if (unlikely(in_item[j].path_len + in_path_len -
-					 out_items[i].path_len >
-				     PATH_MAX))
+		stratum_prefix[STRATA_ROOT_LEN] = '\0';
+		strcat(stratum_prefix, stratum[st]);
+		/* check for a match on something contained in one of the
+		 * configured directories */
+		for (i = 0; i < out_item_count; i++) {
+			if (strncmp(in_path, out_items[i].path,
+				    out_items[i].path_len) ||
+			    in_path[out_items[i].path_len] != '/' ||
+			    out_items[i].file_type != FILE_TYPE_DIRECTORY)
 				continue;
-			strcpy(tmp_path, in_item[j].path);
-			strcat(tmp_path, in_path + out_items[i].path_len);
-			for (st = 0; st < nstratum; st++) {
-				if (unlikely(STRATA_ROOT_LEN + stratum_len[st] >
+			struct in_item *in_item = out_items[i].in_items;
+			for (j = 0; j < out_items[i].in_item_count; j++) {
+				if (unlikely(in_item[j].path_len + in_path_len -
+						 out_items[i].path_len >
 					     PATH_MAX))
 					continue;
-				stratum_prefix[STRATA_ROOT_LEN] = '\0';
-				strcat(stratum_prefix, stratum[st]);
+				strcpy(tmp_path, in_item[j].path);
+				strcat(tmp_path, in_path + out_items[i].path_len);
 
 				fd = brp_openplus(tmp_path, stratum_prefix,
 						  stbuf);
@@ -759,26 +758,19 @@ int corresponding(char *in_path, struct stat *stbuf,
 				}
 			}
 		}
-	}
 
-	/*
-	 * Check for a match on a virtual parent directory of a configured
-	 * item.
-	 */
-	for (i = 0; i < out_item_count; i++) {
-		if (strncmp(out_items[i].path, in_path, in_path_len) ||
-		    (out_items[i].path[in_path_len] != '/' &&
-		     out_items[i].path[in_path_len] != '\0'))
-			continue;
+		/*
+		 * Check for a match on a virtual parent directory of a
+		 * configured item.
+		 */
+		for (i = 0; i < out_item_count; i++) {
+			if (strncmp(out_items[i].path, in_path, in_path_len) ||
+			    (out_items[i].path[in_path_len] != '/' &&
+			     out_items[i].path[in_path_len] != '\0'))
+				continue;
 
-		struct in_item *in_item = out_items[i].in_items;
-		for (j = 0; j < out_items[i].in_item_count; j++) {
-			for (st = 0; st < nstratum; st++) {
-				if (unlikely(STRATA_ROOT_LEN + stratum_len[st] >
-					     PATH_MAX))
-					continue;
-				stratum_prefix[STRATA_ROOT_LEN] = '\0';
-				strcat(stratum_prefix, stratum[st]);
+			struct in_item *in_item = out_items[i].in_items;
+			for (j = 0; j < out_items[i].in_item_count; j++) {
 				fd = brp_openplus(in_item[j].path,
 						  stratum_prefix, stbuf);
 				if (fd >= 0) {
@@ -1013,30 +1005,32 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 
 	strcpy(stratum_prefix, STRATA_ROOT);
 
-	for (i = 0; i < out_item_count; i++) {
-		/*
-		 * Check for contents of one of the configured directories
-		 */
-		in_item = out_items[i].in_items;
-		if (strncmp(in_path, out_items[i].path, out_items[i].path_len) ||
-		    (in_path[out_items[i].path_len] != '\0' &&
-		     in_path[out_items[i].path_len] != '/') ||
-		    out_items[i].file_type != FILE_TYPE_DIRECTORY)
+	for (st = 0; st < nstratum; st++) {
+		if (unlikely(STRATA_ROOT_LEN + stratum_len[st] > PATH_MAX))
 			continue;
-		for (j = 0; j < out_items[i].in_item_count; j++) {
-			for (st = 0; st < nstratum; st++) {
+		stratum_prefix[STRATA_ROOT_LEN] = '\0';
+		strcat(stratum_prefix, stratum[st]);
+		for (i = 0; i < out_item_count; i++) {
+			/*
+			 * Check for contents of one of the configured
+			 * directories
+			 */
+			in_item = out_items[i].in_items;
+			if (strncmp(in_path, out_items[i].path,
+				    out_items[i].path_len) ||
+			    (in_path[out_items[i].path_len] != '\0' &&
+			     in_path[out_items[i].path_len] != '/') ||
+			    out_items[i].file_type != FILE_TYPE_DIRECTORY)
+				continue;
+			for (j = 0; j < out_items[i].in_item_count; j++) {
 				if (in_item[j].path_len + in_path_len -
-				    out_items[i].path_len > PATH_MAX)
-					continue;
-				if (STRATA_ROOT_LEN + stratum_len[st] >
+					out_items[i].path_len >
 				    PATH_MAX)
 					continue;
 
 				strcpy(out_path, in_item[j].path);
 				strcat(out_path, in_path + out_items[i].path_len);
 
-				stratum_prefix[STRATA_ROOT_LEN] = '\0';
-				strcat(stratum_prefix, stratum[st]);
 
 				int fd = brp_openplus(out_path, stratum_prefix, &stbuf);
 				if (fd < 0)
@@ -1060,24 +1054,17 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 				}
 			}
 		}
-	}
-	for (i = 0; i < out_item_count; i++) {
-		/*
-		 * Check for a match directly on one of the configured items or
-		 * a virtual parent directory
-		 */
-		if (strncmp(out_items[i].path, in_path, in_path_len) ||
-		    out_items[i].path[in_path_len] != '/')
-			continue;
+		for (i = 0; i < out_item_count; i++) {
+			/*
+			 * Check for a match directly on one of the configured
+			 * items or a virtual parent directory
+			 */
+			if (strncmp(out_items[i].path, in_path, in_path_len) ||
+			    out_items[i].path[in_path_len] != '/')
+				continue;
 
-		in_item = out_items[i].in_items;
-		for (j = 0; j < out_items[i].in_item_count; j++) {
-			for (st = 0; st < nstratum; st++) {
-				if (STRATA_ROOT_LEN + stratum_len[st] > PATH_MAX)
-					continue;
-				stratum_prefix[STRATA_ROOT_LEN] = '\0';
-				strcat(stratum_prefix, stratum[st]);
-
+			in_item = out_items[i].in_items;
+			for (j = 0; j < out_items[i].in_item_count; j++) {
 				int fd = brp_openplus(in_item[j].path,
 						      stratum_prefix, &stbuf);
 				if (fd > 0) {
