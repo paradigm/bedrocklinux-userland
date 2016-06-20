@@ -583,132 +583,17 @@ int write_attempt(const char* path)
 	}
 }
 
-/*
- * Open and stat a file in a strata, treating absolute symlinks as symlinks
- * relative to the strata's root. @path must be an absolute path.
- *
- * Returns the file descriptor on success, <0 on failure.  If there is no resulting
- * file/directory it is considered an error (unlike, for example, readlink(2)).
- *
- * This is used over something like realpath() due to the need to have absolute
- * symlinks start at the symlink's stratum's root.  e.g. if a symlink at
- * "/bedrock/strata/foo/bar" symlinks to "/qux" that should be treated as
- * "/bedrock/strata/foo/qux".
- */
-int brp_openplus(char *path, char *stratum_prefix, struct stat *stbuf)
-{
-	char *slash;
-	const int LOOP_MAX = 20;
-	int end = 0;
-	int loop = 0;
-	size_t offset;
-	ssize_t readlink_len;
-
-	char current_path[PATH_MAX + 1];
-	char link_path[PATH_MAX + 1];
-	char path_fragment[PATH_MAX + 1];
-	char out_path[PATH_MAX + 1];
-
-	size_t stratum_prefix_len = strlen(stratum_prefix);
-
-	if (stratum_prefix_len > PATH_MAX)
-		return -ENAMETOOLONG;
-
-	/*
-	 * Ensure incoming path is in stratum_prefix/<stratum>/, get stratum
-	 * prefix.
-	 */
-	slash = path;
-	while (*slash != '/') {
-		slash++;
-	}
-
-	offset = slash - path;
-
-	strcpy(current_path, path);
-
-	/*
-	 * Loop over every directory in a given file path, e.g. in
-	 * "/foo/bar/baz/" loop over "/foo" then "/foo/bar" then
-	 * "/foo/bar/baz", starting with the stratum_prefix.  If any directory
-	 * is found to be a symlink, resolve symlink then start over.
-	 */
-	while (1) {
-		/* find next file/directory in file path */
-		while (current_path[offset] != '/' &&
-		       current_path[offset] != '\0') {
-			offset++;
-		}
-		/* on final item in file path, the file itself */
-		if (current_path[offset] == '\0') {
-			end = 1;
-		}
-		/* starting / */
-		if (offset == 0 && current_path[offset] == '/') {
-			offset++;
-			continue;
-		}
-		/* would overflow */
-		if (offset >= PATH_MAX) {
-			return -ENAMETOOLONG;
-		}
-
-		strcpy(path_fragment, stratum_prefix);
-		strncat(path_fragment, current_path, offset);
-
-		if (lstat(path_fragment, stbuf) != 0) {
-			return -ENOENT;
-		}
-		if (!S_ISLNK(stbuf->st_mode) && !end) {
-			offset++;
-			continue;
-		}
-		if (!S_ISLNK(stbuf->st_mode) && end) {
-			return S_ISDIR(stbuf->st_mode)
-				   ? open(current_path, O_RDONLY | O_DIRECTORY)
-				   : open(current_path, O_RDONLY);
-		}
-		if (S_ISLNK(stbuf->st_mode)) {
-			if ((readlink_len = readlink(path_fragment, link_path,
-						     PATH_MAX)) < 0) {
-				return -errno;
-			}
-			link_path[readlink_len] = '\0';
-			if (link_path[0] == '/') {
-				/* absolute symlink */
-				strcpy(out_path, stratum_prefix);
-				strcat(out_path, link_path);
-				strcat(out_path, current_path + offset);
-			} else {
-				/* relative symlink */
-				if ((slash = strrchr(path_fragment, '/'))) {
-					strncpy(out_path, path_fragment,
-						slash - path_fragment + 1);
-					out_path[slash - path_fragment + 1] =
-					    '\0';
-				} else {
-					strcpy(out_path, "./");
-				}
-				strcat(out_path, link_path);
-				strcat(out_path, current_path + offset);
-			}
-			offset = 1;
-			end = 0;
-			strcpy(current_path, out_path + stratum_prefix_len);
-			if ((loop++) >= LOOP_MAX) {
-				return -ELOOP;
-			}
-		}
-	}
-}
+static int brp_orig_cwd, brp_orig_root;
 
 /*
  * Given an input path, finds the corresponding content to output (if any) and
  * populates various related fields (e.g. stat info) accordingly.
  *
- * Returns a file descriptor to the found file, -ENOENT indicates not found
+ * Returns 0 if found, -ENOENT indicates not found
+ *
+ * If out_fd is not NULL, the file will be opened, and file descriptor assigned.
  */
-int corresponding(char *in_path, struct stat *stbuf,
+int corresponding(char *in_path, int *out_fd, struct stat *stbuf,
 		  struct out_item **arg_out_item, int *stratum_id,
 		  struct in_item **arg_in_item, char **tail)
 {
@@ -718,19 +603,43 @@ int corresponding(char *in_path, struct stat *stbuf,
 		return 0;
 	}
 
+	int retval = -ENOENT;
+
 	size_t i, j;
 	size_t in_path_len = strlen(in_path);
-	int fd, st;
-	char stratum_prefix[PATH_MAX + 1], tmp_path[PATH_MAX + 1];
-	strcpy(stratum_prefix, STRATA_ROOT);
+	int st;
+	char tmp_path[PATH_MAX + 1];
+	int *stratum_root_fd = malloc(sizeof(int) * nstratum);
+
+	int ret = chdir(STRATA_ROOT);
+	if (unlikely(ret < 0)) {
+		// strata root missing?!
+		perror("Failed to chdir to strata root");
+		exit(1);
+	}
+
+	for (st = 0; st < nstratum; st++)
+		stratum_root_fd[st] = open(stratum[st], O_RDONLY | O_DIRECTORY);
 
 	for (st = 0; st < nstratum; st++) {
-		if (unlikely(STRATA_ROOT_LEN + stratum_len[st] > PATH_MAX))
+		if (unlikely(stratum_root_fd[st] < 0))
 			continue;
-		stratum_prefix[STRATA_ROOT_LEN] = '\0';
-		strcat(stratum_prefix, stratum[st]);
-		/* check for a match on something contained in one of the
-		 * configured directories */
+
+		ret = seteuid(0);
+		if (unlikely(ret < 0))
+			return -errno;
+
+		ret = fchdir(stratum_root_fd[st]);
+		if (unlikely(ret < 0))
+			continue;
+		ret = chroot(".");
+		if (unlikely(ret < 0))
+			continue;
+
+		SET_CALLER_UID();
+
+		/* check for a match on something contained in one of the configured
+		 * directories */
 		for (i = 0; i < out_item_count; i++) {
 			if (strncmp(in_path, out_items[i].path,
 				    out_items[i].path_len) ||
@@ -739,23 +648,26 @@ int corresponding(char *in_path, struct stat *stbuf,
 				continue;
 			struct in_item *in_item = out_items[i].in_items;
 			for (j = 0; j < out_items[i].in_item_count; j++) {
-				if (unlikely(in_item[j].path_len + in_path_len -
-						 out_items[i].path_len >
-					     PATH_MAX))
+				if (in_item[j].stratum_id >= 0 && in_item[j].stratum_id != st)
+					continue;
+
+				if (unlikely(in_item[j].path_len+in_path_len-out_items[i].path_len > PATH_MAX))
 					continue;
 				strcpy(tmp_path, in_item[j].path);
 				strcat(tmp_path, in_path + out_items[i].path_len);
 
-				fd = brp_openplus(tmp_path, stratum_prefix,
-						  stbuf);
-				if (fd >= 0) {
-					*arg_out_item = &out_items[i];
-					*arg_in_item =
-					    &out_items[i].in_items[j];
-					*stratum_id = st;
-					*tail = in_path + out_items[i].path_len;
-					return fd;
-				}
+				ret = stat(tmp_path, stbuf);
+				if (ret < 0)
+					continue;
+				*arg_out_item = &out_items[i];
+				*arg_in_item = &out_items[i].in_items[j];
+				*stratum_id = st;
+				*tail = in_path + out_items[i].path_len;
+
+				if (out_fd)
+					*out_fd = open(tmp_path, O_RDONLY);
+				retval = 0;
+				goto end;
 			}
 		}
 
@@ -771,24 +683,60 @@ int corresponding(char *in_path, struct stat *stbuf,
 
 			struct in_item *in_item = out_items[i].in_items;
 			for (j = 0; j < out_items[i].in_item_count; j++) {
-				fd = brp_openplus(in_item[j].path,
-						  stratum_prefix, stbuf);
-				if (fd >= 0) {
-					*arg_out_item = &out_items[i];
-					*arg_in_item =
-					    &out_items[i].in_items[j];
-					*stratum_id = st;
-					*tail = "";
-					if (out_items[i].path[in_path_len] == '/' ||
-					    out_items[i].file_type == FILE_TYPE_DIRECTORY)
-						memcpy(stbuf, &parent_stat, sizeof(parent_stat));
-					return fd;
-				}
+				if (in_item[j].stratum_id >= 0 && in_item[j].stratum_id != st)
+					continue;
+
+				int ret = stat(in_item[j].path, stbuf);
+				if (ret < 0)
+					continue;
+				*arg_out_item = &out_items[i];
+				*arg_in_item = &out_items[i].in_items[j];
+				*stratum_id = st;
+				*tail = "";
+				if (out_items[i].path[in_path_len] == '/' ||
+				    out_items[i].file_type == FILE_TYPE_DIRECTORY)
+					memcpy(stbuf, &parent_stat, sizeof(parent_stat));
+				if (out_fd)
+					*out_fd = open(tmp_path, O_RDONLY);
+				retval = 0;
+				goto end;
 			}
 		}
 	}
 
-	return -ENOENT;
+end:
+	for (st = 0; st < nstratum; st++)
+		if (stratum_root_fd[st] > 0)
+			close(stratum_root_fd[st]);
+
+	free(stratum_root_fd);
+
+	// If anything goes wrong here, we are stuck in a different root.
+	// In that case we give up and quit.
+	ret = seteuid(0);
+	if (unlikely(ret < 0)) {
+		perror("seteuid");
+		exit(1);
+	}
+	ret = fchdir(brp_orig_root);
+	if (unlikely(ret < 0)) {
+		perror("Failed to chdir to original root");
+		exit(1);
+	}
+
+	ret = chroot(".");
+	if (unlikely(ret < 0)) {
+		perror("Failed to chroot to original root");
+		exit(1);
+	}
+
+	ret = fchdir(brp_orig_cwd);
+	if (unlikely(ret < 0)) {
+		perror("Failed to change back to old cwd");
+		exit(1);
+	}
+
+	return retval;
 }
 
 /*
@@ -947,7 +895,7 @@ static int brp_getattr(const char *in_path, struct stat *stbuf)
 	struct in_item *in_item;
 	char *tail;
 	char *config_str;
-	int ret;
+	int ret, fd;
 	int stratum_id;
 
 	if (in_path[0] == '/' && in_path[1] == '\0') {
@@ -967,8 +915,8 @@ static int brp_getattr(const char *in_path, struct stat *stbuf)
 		}
 	}
 
-	if ((ret = corresponding((char *)in_path, stbuf, &out_item, &stratum_id, &in_item, &tail)) >= 0) {
-		stat_filter(stbuf, ret, out_item->filter, stratum_id, in_item, tail);
+	if ( (ret = corresponding((char*)in_path, &fd, stbuf, &out_item, &stratum_id, &in_item, &tail)) >= 0) {
+		stat_filter(stbuf, fd, out_item->filter, stratum_id, in_item, tail);
 		return 0;
 	} else {
 		return ret;
@@ -985,7 +933,7 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 	(void)offset;
 	(void)fi;
 
-	char stratum_prefix[PATH_MAX + 1], out_path[PATH_MAX + 1];
+	char out_path[PATH_MAX + 1];
 	size_t i, j;
 	int st;
 	size_t in_path_len = strlen(in_path);
@@ -997,19 +945,39 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 	struct in_item *in_item;
 	int ret_val = -ENOENT;
 	char *slash;
+	int *stratum_root_fd = malloc(sizeof(int)*nstratum);
+
+	int ret = chdir(STRATA_ROOT);
+	if (unlikely(ret < 0)) {
+		// strata root missing?!
+		perror("Failed to chdir to strata root");
+		exit(1);
+	}
+
+	for (st = 0; st < nstratum; st++)
+		stratum_root_fd[st] = open(stratum[st], O_RDONLY|O_DIRECTORY);
 
 	struct dirent *dir;
 
 	struct str_vec v;
 	str_vec_new(&v);
 
-	strcpy(stratum_prefix, STRATA_ROOT);
-
 	for (st = 0; st < nstratum; st++) {
-		if (unlikely(STRATA_ROOT_LEN + stratum_len[st] > PATH_MAX))
+		if (unlikely(stratum_root_fd[st] < 0))
 			continue;
-		stratum_prefix[STRATA_ROOT_LEN] = '\0';
-		strcat(stratum_prefix, stratum[st]);
+
+		ret = seteuid(0);
+		if (unlikely(ret < 0))
+			return -errno;
+
+		ret = fchdir(stratum_root_fd[st]);
+		if (unlikely(ret < 0))
+			continue;
+		ret = chroot(".");
+		if (unlikely(ret < 0))
+			continue;
+
+		SET_CALLER_UID();
 		for (i = 0; i < out_item_count; i++) {
 			/*
 			 * Check for contents of one of the configured
@@ -1023,23 +991,25 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 			    out_items[i].file_type != FILE_TYPE_DIRECTORY)
 				continue;
 			for (j = 0; j < out_items[i].in_item_count; j++) {
+				if (in_item[j].stratum_id >= 0 && in_item[j].stratum_id != st)
+					continue;
+
 				if (in_item[j].path_len + in_path_len -
-					out_items[i].path_len >
-				    PATH_MAX)
+				    out_items[i].path_len > PATH_MAX)
 					continue;
 
 				strcpy(out_path, in_item[j].path);
 				strcat(out_path, in_path + out_items[i].path_len);
 
-
-				int fd = brp_openplus(out_path, stratum_prefix, &stbuf);
-				if (fd < 0)
+				ret = stat(out_path, &stbuf);
+				if (ret < 0)
 					continue;
 
 				if (S_ISDIR(stbuf.st_mode)) {
-					DIR *d = fdopendir(fd);
+					DIR *d = opendir(out_path);
 					if (!d) {
-						perror("fdopendir()");
+						perror("opendir()");
+						continue;
 					}
 					while ( (dir = readdir(d) )) {
 						str_vec_append(&v, dir->d_name);
@@ -1065,21 +1035,23 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 
 			in_item = out_items[i].in_items;
 			for (j = 0; j < out_items[i].in_item_count; j++) {
-				int fd = brp_openplus(in_item[j].path,
-						      stratum_prefix, &stbuf);
-				if (fd > 0) {
-					close(fd);
+				if (in_item[j].stratum_id >= 0 &&
+				    in_item[j].stratum_id != st)
+					continue;
 
-					if (out_items[i].path_len - in_path_len - 1 >
-					    PATH_MAX)
-						continue;
-					strcpy(out_path, out_items[i].path + in_path_len + 1);
-					if ((slash = strchr(out_path, '/'))) {
-						*slash = '\0';
-					}
-					str_vec_append(&v, out_path);
-					break;
+				ret = stat(in_item[j].path, &stbuf);
+				if (ret < 0)
+					continue;
+				if (out_items[i].path_len - in_path_len - 1 >
+				    PATH_MAX)
+					continue;
+				strcpy(out_path,
+				       out_items[i].path + in_path_len + 1);
+				if ((slash = strchr(out_path, '/'))) {
+					*slash = '\0';
 				}
+				str_vec_append(&v, out_path);
+				break;
 			}
 		}
 	}
@@ -1100,6 +1072,37 @@ static int brp_readdir(const char *in_path, void *buf, fuse_fill_dir_t filler, o
 	}
 
 	str_vec_free(&v);
+
+	for (st = 0; st < nstratum; st++)
+		if (stratum_root_fd[st] >= 0)
+			close(stratum_root_fd[st]);
+
+	free(stratum_root_fd);
+
+	// If anything goes wrong here, we are stuck in a different root.
+	// In that case we give up and quit.
+	ret = seteuid(0);
+	if (unlikely(ret < 0)) {
+		perror("seteuid");
+		exit(1);
+	}
+	ret = fchdir(brp_orig_root);
+	if (unlikely(ret < 0)) {
+		perror("Failed to chdir to original root");
+		exit(1);
+	}
+
+	ret = chroot(".");
+	if (unlikely(ret < 0)) {
+		perror("Failed to chroot to original root");
+		exit(1);
+	}
+
+	ret = fchdir(brp_orig_cwd);
+	if (unlikely(ret < 0)) {
+		perror("Failed to change back to old cwd");
+		exit(1);
+	}
 
 	return ret_val;
 }
@@ -1145,8 +1148,7 @@ static int brp_open(const char *in_path, struct fuse_file_info *fi)
 		return -EACCES;
 	}
 
-	if ( (ret = corresponding((char*)in_path, &stbuf, &out_item, &stratum_id, &in_item, &tail)) >= 0) {
-		close(ret);
+	if ( (ret = corresponding((char*)in_path, NULL, &stbuf, &out_item, &stratum_id, &in_item, &tail)) >= 0) {
 		return 0;
 	}
 	return -ENOENT;
@@ -1166,7 +1168,7 @@ static int brp_read(const char *in_path, char *buf, size_t size, off_t offset, s
 	char *tail;
 	char *config_str;
 	struct stat stbuf;
-	int ret;
+	int ret, fd;
 
 	if (strcmp(in_path, "/reparse_config") == 0) {
 		config_str = config_contents();
@@ -1179,12 +1181,12 @@ static int brp_read(const char *in_path, char *buf, size_t size, off_t offset, s
 		return ret;
 	}
 
-	ret = corresponding((char*) in_path, &stbuf, &out_item, &stratum_id, &in_item, &tail);
+	ret = corresponding((char*) in_path, &fd, &stbuf, &out_item, &stratum_id, &in_item, &tail);
 	if (ret < 0) {
 		return ret;
 	}
 
-	return read_filter(ret, out_item->filter, stratum_id, in_item, tail, buf, size, offset);
+	return read_filter(fd, out_item->filter, stratum_id, in_item, tail, buf, size, offset);
 }
 
 /*
@@ -1248,6 +1250,18 @@ int main(int argc, char *argv[])
 	 */
 	if (getuid() != 0) {
 		fprintf(stderr, "ERROR: not running as root, aborting.\n");
+		return 1;
+	}
+
+	brp_orig_cwd = open(".", O_RDONLY|O_DIRECTORY);
+	if (brp_orig_cwd < 0) {
+		perror("Failed to open working directory");
+		return 1;
+	}
+
+	brp_orig_root = open("/", O_RDONLY|O_DIRECTORY);
+	if (brp_orig_root < 0) {
+		perror("Failed to open root directory");
 		return 1;
 	}
 
