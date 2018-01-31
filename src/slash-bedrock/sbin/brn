@@ -428,6 +428,12 @@ fi
 default_stratum=$(awk '$1 == "default_stratum" {default=$3} END {print ""default""}' /bedrock/etc/brn.conf)
 default_cmd=$(awk '$1 == "default_cmd" {default=$3} END {print ""default""}' /bedrock/etc/brn.conf)
 default_timeout=$(awk 'BEGIN{timeout=-1} $1 == "timeout" {timeout=$3} END {print timeout+0}' /bedrock/etc/brn.conf)
+
+if [ "$default_cmd" = "" ]
+then
+	default_cmd=$(bri -c "$default_stratum" init)
+fi
+
 get_init_choice
 i=$?
 
